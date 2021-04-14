@@ -205,4 +205,87 @@ end
     return (c_re, c_du)
 end
 
+# ----
+# WMMATropical
+# ----
+
+struct WMMATropicalOp{M, N, K} end
+
+@inline shape(::Type{WMMATropicalOp{M, N, K}}) where {M, N, K} = (M = M, N = N, K = K)
+
+# convert_index_func: function used to transpose the index in case of a row-major layout
+for (layout_type, wmma_layout_type, convert_index_func) in [
+                                        (Layout.AlignedColMajor, WMMA.ColMajor, identity),
+                                        (Layout.AlignedRowMajor, WMMA.RowMajor, x -> reverse(Tuple(x)))
+                                       ]
+    @eval begin
+        @inline fragtype_a(::Type{WMMATropicalOp{16, 16, 16}}, ::Type{$layout_type{Float16}}) = WMMA.Fragment{16, 16, 16, 16, Float16, $wmma_layout_type, WMMA.MatrixA}
+        @inline fragtype_b(::Type{WMMATropicalOp{16, 16, 16}}, ::Type{$layout_type{Float16}}) = WMMA.Fragment{16, 16, 16, 16, Float16, $wmma_layout_type, WMMA.MatrixB}
+        @inline fragtype_accum(::Type{WMMATropicalOp{16, 16, 16}}, ::Type{$layout_type{Float32}}) = WMMA.Fragment{16, 16, 16, 8, Float32, WMMA.Unspecified, WMMA.Accumulator}
+
+        @inline function load_a(::Type{WMMATropicalOp{M, N, K}}, ::Type{$layout_type{Float16}}, workspace, tile::Tile) where {M, N, K}
+            conf = WMMA.Config{M, N, K, Float32}
+
+            linear_base = linearise($convert_index_func(tile.base), size(workspace))
+            linear_offset = linearise($convert_index_func(tile.offset), size(workspace))
+
+            ptr = pointer(workspace, linear_base) + (linear_offset - 1) * sizeof(Float16)
+            return WMMA.load_a(ptr, size(workspace, 1), $wmma_layout_type, conf)
+        end
+
+        @inline function load_b(::Type{WMMATropicalOp{M, N, K}}, ::Type{$layout_type{Float16}}, workspace, tile::Tile) where {M, N, K}
+            conf = WMMA.Config{M, N, K, Float32}
+
+            linear_base = linearise($convert_index_func(tile.base), size(workspace))
+            linear_offset = linearise($convert_index_func(tile.offset), size(workspace))
+
+            ptr = pointer(workspace, linear_base) + (linear_offset - 1) * sizeof(Float16)
+            return WMMA.load_b(ptr, size(workspace, 1), $wmma_layout_type, conf)
+        end
+
+        @inline function load_c(::Type{WMMATropicalOp{M, N, K}}, ::Type{$layout_type{Float32}}, workspace, tile::Tile) where {M, N, K}
+            conf = WMMA.Config{M, N, K, Float32}
+
+            linear_base = linearise($convert_index_func(tile.base), size(workspace))
+            linear_offset = linearise($convert_index_func(tile.offset), size(workspace))
+
+            ptr = pointer(workspace, linear_base) + (linear_offset - 1) * sizeof(Float32)
+            return WMMA.load_c(ptr, size(workspace, 1), $wmma_layout_type, conf)
+        end
+
+        @inline function store_d(::Type{WMMATropicalOp{M, N, K}}, ::Type{$layout_type{Float32}}, workspace, frag, tile::Tile) where {M, N, K}
+            conf = WMMA.Config{M, N, K, Float32}
+
+            linear_base = linearise($convert_index_func(tile.base), size(workspace))
+            linear_offset = linearise($convert_index_func(tile.offset), size(workspace))
+
+            ptr = pointer(workspace, linear_base) + (linear_offset - 1) * sizeof(Float32)
+            WMMA.store_d(ptr, frag, size(workspace, 1), $wmma_layout_type, conf)
+        end
+    end
+end
+
+function mma(::Type{WMMATropicalOp{M, N, K}}, a_frag, b_frag, c_frag) where {M, N, K}
+    conf = WMMA.Config{M, N, K, Float32}
+    return tropical_mma(a_frag, b_frag, c_frag, conf)
+end
+
+@generated function tropical_mma(a::Fragment{M, N, K, A_SZ, A_T, A_L, MatrixA},
+                        b::Fragment{M, N, K, B_SZ, B_T, B_L, MatrixB},
+                        c::Fragment{M, N, K, C_SZ, C_T, Unspecified, Accumulator},
+                        config::Type{Config{M, N, K, D_T}}) where {M, N, K, A_SZ, A_T, A_L, B_SZ, B_T, B_L, C_SZ, C_T, D_T}
+    d_num_els, _, _, d_arr_str         = get_hl_frag_info("d", D_T)
+    return quote
+        d = copy(c)
+        for i=1:size(a_frag, 1)
+            for j=1:size(b_frag, 2)
+                for k=1:size(a_frag, 2)
+                    d[i,j] = max(d[i,j], a_frag[i,k] + b_frag[k,j])
+                end
+            end
+        end
+        return Fragment{$M, $N, $K, $d_num_els, $D_T, Unspecified, Accumulator}(d)
+    end
+end
+
 end
